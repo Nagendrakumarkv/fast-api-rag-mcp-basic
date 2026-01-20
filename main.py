@@ -2,115 +2,136 @@ import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import List, Dict
+from typing import Literal, Annotated, List
 
-# LangChain Imports
+# LangChain & Graph Imports
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables.history import RunnableWithMessageHistory
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain.tools import tool
+from langgraph.graph import StateGraph, END
+from langgraph.prebuilt import ToolNode
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+from typing_extensions import TypedDict
+import operator
 
 # 1. Load Environment Variables
 load_dotenv()
 
-app = FastAPI(title="Day 4: RAG Chat with Memory")
+app = FastAPI(title="Day 5: LangGraph AI Agent")
 
 # --- CONFIGURATION ---
 embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
+vectorstore = PineconeVectorStore(index_name="rag-app", embedding=embeddings)
 
-vectorstore = PineconeVectorStore(
-    index_name="rag-app",
-    embedding=embeddings
-)
+# --- DEFINE TOOLS ---
 
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    temperature=0
-)
+@tool
+def search_pdf_knowledge_base(query: str):
+    """Use this tool when answering questions about the candidate's resume, CV, or specific document info."""
+    print(f"🕵️‍♂️ AGENT LOG: Searching PDF for '{query}'...")
+    docs = vectorstore.similarity_search(query, k=3)
+    return "\n\n".join([doc.page_content for doc in docs])
 
-# --- MEMORY STORAGE (In-Memory) ---
-# In a real app, you would use Redis here. For now, a Python dictionary works.
-# Format: { "session_id_1": [Message1, Message2], "session_id_2": ... }
-store: Dict[str, BaseChatMessageHistory] = {}
+@tool
+def search_web(query: str):
+    """Use this tool for current events, weather, or general knowledge NOT in the resume."""
+    print(f"🌍 AGENT LOG: Searching Web for '{query}'...")
+    search = DuckDuckGoSearchRun()
+    return search.invoke(query)
 
-def get_session_history(session_id: str) -> BaseChatMessageHistory:
-    """
-    Retrieves the chat history for a specific session ID.
-    If it doesn't exist, it creates a new empty history.
-    """
-    if session_id not in store:
-        store[session_id] = ChatMessageHistory()
-    return store[session_id]
+# List of tools the AI can use
+tools = [search_pdf_knowledge_base, search_web]
 
-# --- DATA MODELS ---
+# --- SETUP MODEL WITH TOOLS ---
+# We bind the tools to the model so it knows they exist
+llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+llm_with_tools = llm.bind_tools(tools)
+
+# --- GRAPH STATE ---
+# This dictionary holds the conversation history
+class AgentState(TypedDict):
+    messages: Annotated[List, operator.add]
+
+# --- GRAPH NODES ---
+
+def chatbot_node(state: AgentState):
+    """The 'Brain' node: It looks at history and decides what to do next."""
+    messages = state["messages"]
+    response = llm_with_tools.invoke(messages)
+    return {"messages": [response]}
+
+# --- GRAPH EDGES (The Router) ---
+
+def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
+    """Decides: Did the AI ask to use a tool? OR is it done talking?"""
+    last_message = state["messages"][-1]
+    
+    # If the AI produced a 'tool_calls' attribute, go to the 'tools' node
+    if last_message.tool_calls:
+        return "tools"
+    # Otherwise, stop
+    return "__end__"
+
+# --- BUILD THE GRAPH ---
+workflow = StateGraph(AgentState)
+
+# 1. Add Nodes
+workflow.add_node("agent", chatbot_node)
+workflow.add_node("tools", ToolNode(tools)) # Prebuilt node that executes tools
+
+# 2. Add Edges
+workflow.set_entry_point("agent") # Start here
+workflow.add_conditional_edges("agent", should_continue) # Decide where to go
+workflow.add_edge("tools", "agent") # Loop back to agent after using a tool
+
+# 3. Compile
+app_graph = workflow.compile()
+
+# --- API ENDPOINT ---
 class ChatRequest(BaseModel):
-    question: str = Field(description="The user's question")
-    session_id: str = Field(description="A unique ID for this conversation (e.g., 'user_123')")
+    question: str
+    session_id: str = "default" # Simplified for Day 5 demo
 
 class ChatResponse(BaseModel):
     answer: str
-    session_id: str
 
-# --- CORE LOGIC (RAG + MEMORY) ---
-# 1. Define the Prompt with History Placeholder
-# --- UPDATED PROMPT (Allows Chit-Chat) ---
-prompt_template = ChatPromptTemplate.from_messages([
-    ("system", """You are a helpful AI assistant.
-    
-    1. If the user asks a question about the document, answer it using the Context below.
-    2. If the user is just chatting (e.g., "Hi", "My name is..."), respond naturally and politely without using the Context.
-    3. If the answer is not in the Context and not general knowledge, say "I don't know."
-    
-    Context:
-    {context}"""),
-    
-    MessagesPlaceholder(variable_name="chat_history"),
-    
-    ("human", "{question}")
-])
-
-# 2. Create the Basic Chain
-chain = prompt_template | llm | StrOutputParser()
-
-# 3. Wrap the Chain with Memory capabilities
-# This wrapper handles reading/writing to the 'store' dictionary automatically
-chain_with_history = RunnableWithMessageHistory(
-    chain,
-    get_session_history,
-    input_messages_key="question",
-    history_messages_key="chat_history"
-)
-
-def get_rag_response(question: str, session_id: str) -> str:
-    # A. Search Pinecone (Retrieval)
-    docs = vectorstore.similarity_search(question, k=3)
-    context_text = "\n\n".join([doc.page_content for doc in docs])
-
-    # B. Generate Answer with Memory
-    # We pass 'context' manually, but 'chat_history' is handled by the wrapper
-    response = chain_with_history.invoke(
-        {"question": question, "context": context_text},
-        config={"configurable": {"session_id": session_id}}
-    )
-
-    return response
-
-# --- API ENDPOINT ---
-@app.post("/chat", response_model=ChatResponse)
-async def chat_with_memory(request: ChatRequest):
+@app.post("/agent", response_model=ChatResponse)
+async def run_agent(request: ChatRequest):
     try:
-        answer_text = get_rag_response(request.question, request.session_id)
-        return ChatResponse(
-            answer=answer_text,
-            session_id=request.session_id
-        )
+        # Run the graph
+        inputs = {"messages": [HumanMessage(content=request.question)]}
+        final_state = app_graph.invoke(inputs)
+        
+        # Get the last message
+        last_message = final_state["messages"][-1]
+        raw_content = last_message.content
+        
+        # --- THE FIX: Handle List vs String content ---
+        final_answer = ""
+        
+        if isinstance(raw_content, str):
+            # If it's already a string, just use it
+            final_answer = raw_content
+        elif isinstance(raw_content, list):
+            # If it's a list (Google sometimes does this), join the text parts
+            # Example: [{'type': 'text', 'text': 'He knows Python'}]
+            final_answer = "".join(
+                [part.get("text", "") for part in raw_content if "text" in part]
+            )
+        else:
+            # Fallback for unexpected types
+            final_answer = str(raw_content)
+            
+        return ChatResponse(answer=final_answer)
+        
     except Exception as e:
         print(f"Error: {e}")
+        # Print the actual content causing the error to help debug
+        if 'final_state' in locals():
+            print(f"Failed Content Structure: {final_state['messages'][-1].content}")
         raise HTTPException(status_code=500, detail=str(e))
-
+    
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

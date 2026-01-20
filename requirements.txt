@@ -9,3 +9,6 @@ langchain-pinecone
 langchain-text-splitters
 pinecone-client
 pypdf
+langgraph
+duckduckgo-search
+ddgs
