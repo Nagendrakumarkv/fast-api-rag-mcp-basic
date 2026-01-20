@@ -1,137 +1,132 @@
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
-from typing import Literal, Annotated, List
+from pydantic import BaseModel
+from typing import Literal, Annotated, List, TypedDict
+import operator
 
-# LangChain & Graph Imports
+# LangChain Imports
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
-from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_community.retrievers import BM25Retriever
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain.tools import tool
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
-from typing_extensions import TypedDict
-import operator
+from langchain_core.messages import HumanMessage
 
-# 1. Load Environment Variables
+# 1. Load Env
 load_dotenv()
 
-app = FastAPI(title="Day 5: LangGraph AI Agent")
+app = FastAPI(title="Day 6: Hybrid Search Agent")
 
-# --- CONFIGURATION ---
+# --- HYBRID SEARCH SETUP ---
+
+print("⚙️  Initializing Hybrid Search...")
+
+# A. Setup Pinecone (Dense / Semantic Search)
 embeddings = GoogleGenerativeAIEmbeddings(model="models/text-embedding-004")
 vectorstore = PineconeVectorStore(index_name="rag-app", embedding=embeddings)
+pinecone_retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
 
-# --- DEFINE TOOLS ---
+# B. Setup BM25 (Sparse / Keyword Search)
+# We load the PDF again to build the keyword index in RAM
+loader = PyPDFLoader("my_cv.pdf") 
+docs = loader.load()
+splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+splits = splitter.split_documents(docs)
+
+bm25_retriever = BM25Retriever.from_documents(splits)
+bm25_retriever.k = 3 # Get top 3 keyword matches
+
+def ensemble_search(query: str, bm25, vector, k: int = 3):
+    """
+    Hybrid search combining BM25 (keyword) and Vector (semantic).
+    Works on ALL LangChain versions.
+    """
+    bm25_docs = bm25.get_relevant_documents(query)
+    vector_docs = vector.get_relevant_documents(query)
+
+    # Deduplicate by page_content
+    seen = set()
+    final_docs = []
+
+    for doc in bm25_docs + vector_docs:
+        if doc.page_content not in seen:
+            seen.add(doc.page_content)
+            final_docs.append(doc)
+
+    return final_docs[:k]
+
+
+print("✅ Hybrid Search Ready!")
+
+# --- AGENT TOOLS ---
 
 @tool
-def search_pdf_knowledge_base(query: str):
-    """Use this tool when answering questions about the candidate's resume, CV, or specific document info."""
-    print(f"🕵️‍♂️ AGENT LOG: Searching PDF for '{query}'...")
-    docs = vectorstore.similarity_search(query, k=3)
+def search_hybrid_knowledge_base(query: str):
+    """Use this tool to find specific details, IDs, names, or general concepts in the candidate's document."""
+    print(f"🕵️‍♂️ HYBRID SEARCH: '{query}'")
+    
+    # This runs BOTH Pinecone and BM25, then combines results
+    docs = ensemble_search(
+    query=query,
+    bm25=bm25_retriever,
+    vector=pinecone_retriever)
+    
     return "\n\n".join([doc.page_content for doc in docs])
 
-@tool
-def search_web(query: str):
-    """Use this tool for current events, weather, or general knowledge NOT in the resume."""
-    print(f"🌍 AGENT LOG: Searching Web for '{query}'...")
-    search = DuckDuckGoSearchRun()
-    return search.invoke(query)
+tools = [search_hybrid_knowledge_base]
 
-# List of tools the AI can use
-tools = [search_pdf_knowledge_base, search_web]
+# --- GRAPH SETUP (Same as Day 5) ---
 
-# --- SETUP MODEL WITH TOOLS ---
-# We bind the tools to the model so it knows they exist
-llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0)
+llm = ChatGoogleGenerativeAI(model="gemini-2.0-flash", temperature=0)
 llm_with_tools = llm.bind_tools(tools)
 
-# --- GRAPH STATE ---
-# This dictionary holds the conversation history
 class AgentState(TypedDict):
     messages: Annotated[List, operator.add]
 
-# --- GRAPH NODES ---
-
 def chatbot_node(state: AgentState):
-    """The 'Brain' node: It looks at history and decides what to do next."""
-    messages = state["messages"]
-    response = llm_with_tools.invoke(messages)
-    return {"messages": [response]}
-
-# --- GRAPH EDGES (The Router) ---
+    return {"messages": [llm_with_tools.invoke(state["messages"])]}
 
 def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
-    """Decides: Did the AI ask to use a tool? OR is it done talking?"""
-    last_message = state["messages"][-1]
-    
-    # If the AI produced a 'tool_calls' attribute, go to the 'tools' node
-    if last_message.tool_calls:
-        return "tools"
-    # Otherwise, stop
-    return "__end__"
+    last_msg = state["messages"][-1]
+    return "tools" if last_msg.tool_calls else "__end__"
 
-# --- BUILD THE GRAPH ---
 workflow = StateGraph(AgentState)
-
-# 1. Add Nodes
 workflow.add_node("agent", chatbot_node)
-workflow.add_node("tools", ToolNode(tools)) # Prebuilt node that executes tools
-
-# 2. Add Edges
-workflow.set_entry_point("agent") # Start here
-workflow.add_conditional_edges("agent", should_continue) # Decide where to go
-workflow.add_edge("tools", "agent") # Loop back to agent after using a tool
-
-# 3. Compile
+workflow.add_node("tools", ToolNode(tools))
+workflow.set_entry_point("agent")
+workflow.add_conditional_edges("agent", should_continue)
+workflow.add_edge("tools", "agent")
 app_graph = workflow.compile()
 
 # --- API ENDPOINT ---
 class ChatRequest(BaseModel):
     question: str
-    session_id: str = "default" # Simplified for Day 5 demo
 
 class ChatResponse(BaseModel):
     answer: str
 
 @app.post("/agent", response_model=ChatResponse)
-async def run_agent(request: ChatRequest):
+async def run_hybrid_agent(request: ChatRequest):
     try:
-        # Run the graph
         inputs = {"messages": [HumanMessage(content=request.question)]}
         final_state = app_graph.invoke(inputs)
         
-        # Get the last message
-        last_message = final_state["messages"][-1]
-        raw_content = last_message.content
-        
-        # --- THE FIX: Handle List vs String content ---
-        final_answer = ""
-        
-        if isinstance(raw_content, str):
-            # If it's already a string, just use it
-            final_answer = raw_content
-        elif isinstance(raw_content, list):
-            # If it's a list (Google sometimes does this), join the text parts
-            # Example: [{'type': 'text', 'text': 'He knows Python'}]
-            final_answer = "".join(
-                [part.get("text", "") for part in raw_content if "text" in part]
-            )
+        # Safe String Conversion (from Day 5 Fix)
+        raw = final_state["messages"][-1].content
+        if isinstance(raw, list):
+            final = "".join([p.get("text","") for p in raw if "text" in p])
         else:
-            # Fallback for unexpected types
-            final_answer = str(raw_content)
+            final = str(raw)
             
-        return ChatResponse(answer=final_answer)
-        
+        return ChatResponse(answer=final)
     except Exception as e:
         print(f"Error: {e}")
-        # Print the actual content causing the error to help debug
-        if 'final_state' in locals():
-            print(f"Failed Content Structure: {final_state['messages'][-1].content}")
         raise HTTPException(status_code=500, detail=str(e))
-    
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

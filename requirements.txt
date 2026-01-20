@@ -12,3 +12,4 @@ pypdf
 langgraph
 duckduckgo-search
 ddgs
+rank_bm25
